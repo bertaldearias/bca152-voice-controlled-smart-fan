@@ -1,32 +1,93 @@
+// lib/aws/app_aws.c -- cloud sync using Firebase Realtime Database (REST API)
+// Same public API as the AWS version, so main.c and app_hw do not change.
+
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
-
-#include "aws_iot_config.h"
-#include "aws_iot_log.h"
-#include "aws_iot_version.h"
-#include "aws_iot_mqtt_client_interface.h"
-#include "aws_iot_shadow_interface.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 
 #include "app_aws.h"
 
 #define TAG "appaws"
 
-// Cryptographic files embedded via board_build.embed_txtfiles
-extern const uint8_t private_pem_key_start[]     asm("_binary_private_pem_key_start");
-extern const uint8_t certificate_pem_crt_start[] asm("_binary_certificate_pem_crt_start");
-extern const uint8_t aws_root_ca_pem_start[]     asm("_binary_AmazonRootCA1_pem_start");
+// FIREBASE_URL comes from platformio.ini build_flags, e.g.
+//   "https://your-project-default-rtdb.firebaseio.com"
+// FIREBASE_AUTH is optional (database secret / token). Leave empty if the
+// database rules allow access.
+#ifndef FIREBASE_AUTH
+#define FIREBASE_AUTH ""
+#endif
 
-static AWS_IoT_Client aws_client;
-static SemaphoreHandle_t aws_guard;   // shadow functions are not thread-safe
+#define POLL_MS 1000
+
+static SemaphoreHandle_t aws_guard;
 static fan_state_changed_f fan_state_changed_cb = NULL;
-static uint8_t desired_state = 0;
+static int last_desired = -1;
 
-static const char *endpoint_address = AWS_ENDPOINT;  // from build_flags
-static const char *thing_name = AWS_THING_NAME;
-static const char *client_id = AWS_THING_NAME;
+static char resp_buf[64];
+static int resp_len = 0;
+
+static esp_err_t http_event(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0)
+    {
+        int n = evt->data_len;
+        if (resp_len + n >= (int)sizeof(resp_buf))
+            n = sizeof(resp_buf) - 1 - resp_len;
+        if (n > 0)
+        {
+            memcpy(resp_buf + resp_len, evt->data, n);
+            resp_len += n;
+            resp_buf[resp_len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static void build_url(char *out, size_t len, const char *path)
+{
+    if (strlen(FIREBASE_AUTH) > 0)
+        snprintf(out, len, "%s%s.json?auth=%s", FIREBASE_URL, path, FIREBASE_AUTH);
+    else
+        snprintf(out, len, "%s%s.json", FIREBASE_URL, path);
+}
+
+// returns HTTP status, or -1 on failure
+static int firebase_request(const char *path, esp_http_client_method_t method, const char *body)
+{
+    char url[256];
+    build_url(url, sizeof(url), path);
+    resp_len = 0;
+    resp_buf[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = method,
+        .event_handler = http_event,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c == NULL)
+        return -1;
+
+    if (body != NULL)
+    {
+        esp_http_client_set_header(c, "Content-Type", "application/json");
+        esp_http_client_set_post_field(c, body, strlen(body));
+    }
+
+    int status = -1;
+    if (esp_http_client_perform(c) == ESP_OK)
+        status = esp_http_client_get_status_code(c);
+    esp_http_client_cleanup(c);
+    return status;
+}
 
 void appaws_init(fan_state_changed_f cb)
 {
@@ -34,109 +95,55 @@ void appaws_init(fan_state_changed_f cb)
     aws_guard = xSemaphoreCreateMutex();
 }
 
-static void disconnected_handler(AWS_IoT_Client *pClient, void *data)
-{
-    ESP_LOGW(TAG, "MQTT disconnected");
-}
-
-// Runs when a voice command changes the desired powerlevel
-static void fan_powerlevel_change_requested(const char *pJsonString,
-                                            uint32_t JsonStringDataLen,
-                                            jsonStruct_t *pContext)
-{
-    if (pContext != NULL)
-    {
-        uint8_t val = *(uint8_t *)(pContext->pData);
-        ESP_LOGI(TAG, "delta received, powerlevel = %d", val);
-        desired_state = val;
-        if (fan_state_changed_cb)
-            fan_state_changed_cb(val);   // calls apphw_set_state()
-    }
-}
-
+// Task: poll /fan/desired and apply changes to the relays
 void appaws_connect(void *param)
 {
-    memset((void *)&aws_client, 0, sizeof(aws_client));
+    ESP_LOGI(TAG, "connected, watching %s", FAN_PATH_DESIRED);
 
-    ShadowInitParameters_t sp = ShadowInitParametersDefault;
-    sp.pHost = (char *)endpoint_address;
-    sp.port = AWS_IOT_MQTT_PORT;
-    sp.pClientCRT = (const char *)certificate_pem_crt_start;
-    sp.pClientKey = (const char *)private_pem_key_start;
-    sp.pRootCA = (const char *)aws_root_ca_pem_start;
-    sp.disconnectHandler = disconnected_handler;
-    aws_iot_shadow_init(&aws_client, &sp);
-
-    ShadowConnectParameters_t scp = ShadowConnectParametersDefault;
-    scp.pMyThingName = thing_name;
-    scp.pMqttClientId = client_id;
-    scp.mqttClientIdLen = (uint16_t)strlen(client_id);
-
-    while (aws_iot_shadow_connect(&aws_client, &scp) != SUCCESS)
-    {
-        ESP_LOGW(TAG, "trying to connect");
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-
-    uint8_t fan_powerlevel = 0;
-    jsonStruct_t fan_controller;
-    fan_controller.cb = fan_powerlevel_change_requested;
-    fan_controller.pData = &fan_powerlevel;
-    fan_controller.pKey = "powerlevel";
-    fan_controller.type = SHADOW_JSON_UINT8;
-    fan_controller.dataLength = sizeof(uint8_t);
-
-    if (aws_iot_shadow_register_delta(&aws_client, &fan_controller) == SUCCESS)
-    {
-        ESP_LOGI(TAG, "shadow delta registered");
-    }
-
-    IoT_Error_t err = SUCCESS;
     while (1)
     {
         if (xSemaphoreTake(aws_guard, 100) == pdTRUE)
         {
-            err = aws_iot_shadow_yield(&aws_client, 250);
+            int status = firebase_request(FAN_PATH_DESIRED, HTTP_METHOD_GET, NULL);
+            if (status == 200)
+            {
+                if (strcmp(resp_buf, "null") != 0 && resp_len > 0)
+                {
+                    int val = atoi(resp_buf);
+                    if (val != last_desired)
+                    {
+                        last_desired = val;
+                        ESP_LOGI(TAG, "desired powerlevel = %d", val);
+                        if (fan_state_changed_cb)
+                            fan_state_changed_cb((uint8_t)val);   // -> apphw_set_state()
+                    }
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "poll failed: %d", status);
+            }
             xSemaphoreGive(aws_guard);
         }
-        if (err != SUCCESS)
-        {
-            ESP_LOGE(TAG, "yield failed: %d", err);
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(POLL_MS / portTICK_PERIOD_MS);
     }
 }
 
-// Called by the hardware library when a button is pressed
+// Called by the hardware library when a physical button is pressed
 void appaws_publish(uint8_t val)
 {
-    jsonStruct_t temp_json = {
-        .cb = NULL,
-        .pKey = "powerlevel",
-        .pData = &val,
-        .type = SHADOW_JSON_UINT8,
-        .dataLength = sizeof(val)};
+    char body[8];
+    snprintf(body, sizeof(body), "%d", val);
 
-    char jsondoc_buffer[200];
-    aws_iot_shadow_init_json_document(jsondoc_buffer, sizeof(jsondoc_buffer));
-    aws_iot_shadow_add_reported(jsondoc_buffer, sizeof(jsondoc_buffer), 1, &temp_json);
-
-    // Update desired too, so AWS doesn't send a delta that undoes the button press
-    if (desired_state != val)
-    {
-        aws_iot_shadow_add_desired(jsondoc_buffer, sizeof(jsondoc_buffer), 1, &temp_json);
-        desired_state = val;
-    }
-    aws_iot_finalize_json_document(jsondoc_buffer, sizeof(jsondoc_buffer));
-
-    IoT_Error_t err = SUCCESS;
     if (xSemaphoreTake(aws_guard, portMAX_DELAY) == pdTRUE)
     {
-        err = aws_iot_shadow_update(&aws_client, thing_name, jsondoc_buffer, NULL, NULL, 4, true);
+        int s1 = firebase_request(FAN_PATH_REPORTED, HTTP_METHOD_PUT, body);
+        // also update desired so the poll loop doesn't undo the button press
+        last_desired = val;
+        int s2 = firebase_request(FAN_PATH_DESIRED, HTTP_METHOD_PUT, body);
         xSemaphoreGive(aws_guard);
-    }
-    if (err != SUCCESS)
-    {
-        ESP_LOGE(TAG, "publish failed: %d", err);
+
+        if (s1 != 200 || s2 != 200)
+            ESP_LOGE(TAG, "publish failed: %d / %d", s1, s2);
     }
 }

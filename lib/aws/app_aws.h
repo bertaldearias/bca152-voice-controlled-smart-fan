@@ -3,7 +3,11 @@
 
 #include <stdint.h>
 
-#define AWS_THING_NAME "myhome_fan1"
+// Firebase Realtime Database layout used by the fan:
+//   /fan/desired     <- written by the app / voice side (0, 33, 66, 100)
+//   /fan/powerlevel  <- reported by the ESP32 (current fan speed)
+#define FAN_PATH_DESIRED "/fan/desired"
+#define FAN_PATH_REPORTED "/fan/powerlevel"
 
 typedef void (*fan_state_changed_f)(uint8_t);
 
